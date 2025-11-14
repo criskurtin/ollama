@@ -60,7 +60,7 @@ func TestAVX512MatmulSmallMatrices(t *testing.T) {
 			}
 
 			// Check for NaN/Inf
-			for i := 0; i < len(bytes)/4; i++ {
+			for i := range len(bytes) / 4 {
 				val := math.Float32frombits(uint32(bytes[i*4]) | uint32(bytes[i*4+1])<<8 |
 					uint32(bytes[i*4+2])<<16 | uint32(bytes[i*4+3])<<24)
 				if math.IsNaN(float64(val)) || math.IsInf(float64(val), 0) {
@@ -98,7 +98,7 @@ func TestAVX512MatmulExactBlockSize(t *testing.T) {
 	bytes := C.Bytes()
 
 	hasNonZero := false
-	for i := 0; i < len(bytes)/4; i++ {
+	for i := range len(bytes) / 4 {
 		val := math.Float32frombits(uint32(bytes[i*4]) | uint32(bytes[i*4+1])<<8 |
 			uint32(bytes[i*4+2])<<16 | uint32(bytes[i*4+3])<<24)
 		if math.IsNaN(float64(val)) || math.IsInf(float64(val), 0) {
@@ -144,7 +144,7 @@ func TestAVX512MatmulLargeMatrices(t *testing.T) {
 			bytes := C.Bytes()
 
 			// Validate output
-			for i := 0; i < len(bytes)/4; i++ {
+			for i := range len(bytes) / 4 {
 				val := math.Float32frombits(uint32(bytes[i*4]) | uint32(bytes[i*4+1])<<8 |
 					uint32(bytes[i*4+2])<<16 | uint32(bytes[i*4+3])<<24)
 				if math.IsNaN(float64(val)) || math.IsInf(float64(val), 0) {
@@ -224,10 +224,10 @@ func TestAVX512MatmulZeros(t *testing.T) {
 	ctx.Forward(C).Compute(C)
 	bytes := C.Bytes()
 
-	for i := 0; i < len(bytes)/4; i++ {
+	for i := range len(bytes) / 4 {
 		val := math.Float32frombits(uint32(bytes[i*4]) | uint32(bytes[i*4+1])<<8 |
 			uint32(bytes[i*4+2])<<16 | uint32(bytes[i*4+3])<<24)
-		if math.Abs(float64(val)) > 0.1 {  // Allow some tolerance
+		if math.Abs(float64(val)) > 0.1 { // Allow some tolerance
 			t.Errorf("Zero matrix multiplication produced non-zero value: %v", val)
 			break
 		}
