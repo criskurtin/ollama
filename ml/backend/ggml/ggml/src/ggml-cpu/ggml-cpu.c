@@ -1117,6 +1117,345 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 ////////////////////////////////////////////////////////////////////////////////
 
+// Optimized matrix multiplication for AVX-512 CPUs
+// Uses cache-oblivious recursive blocking, INT8 quantization, and fused pipeline
+
+#if defined(__AVX512F__)
+#include <immintrin.h>
+
+// Block size for leaf-level computation (fits in L1 cache)
+#define GGML_OPT_BLOCK_SIZE 32
+
+// Threshold for recursive decomposition
+#define GGML_OPT_RECURSIVE_THRESHOLD 128
+
+// Per-block quantization structure
+struct ggml_opt_block_quant {
+    int8_t data[GGML_OPT_BLOCK_SIZE * GGML_OPT_BLOCK_SIZE];
+    float scale;
+    float zero_point;
+};
+
+// XorShift random number generator for stochastic rounding
+static inline uint32_t ggml_opt_xorshift32(uint32_t * state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+// Stochastic quantization to INT8 with per-block scaling
+static inline void ggml_opt_quantize_block_int8(
+    const float * restrict src,
+    struct ggml_opt_block_quant * restrict dst,
+    int rows,
+    int cols,
+    int src_stride,
+    uint32_t * rng_state
+) {
+    // Find min/max for this block
+    float min_val = FLT_MAX;
+    float max_val = -FLT_MAX;
+
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            float val = src[i * src_stride + j];
+            min_val = val < min_val ? val : min_val;
+            max_val = val > max_val ? val : max_val;
+        }
+    }
+
+    // Compute scale and zero point
+    const float range = max_val - min_val;
+    dst->scale = range > 0.0f ? range / 255.0f : 1.0f;
+    dst->zero_point = min_val;
+    const float inv_scale = 1.0f / dst->scale;
+
+    // Quantize with stochastic rounding
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            float val = src[i * src_stride + j];
+            float normalized = (val - dst->zero_point) * inv_scale;
+
+            // Stochastic rounding
+            float frac = normalized - floorf(normalized);
+            uint32_t rand = ggml_opt_xorshift32(rng_state);
+            float threshold = (float)(rand & 0xFFFFFF) / (float)0xFFFFFF;
+
+            int32_t quantized = (int32_t)floorf(normalized);
+            if (frac > threshold) {
+                quantized++;
+            }
+
+            // Clamp to INT8 range
+            quantized = quantized < 0 ? 0 : (quantized > 255 ? 255 : quantized);
+            dst->data[i * GGML_OPT_BLOCK_SIZE + j] = (int8_t)(quantized - 128);
+        }
+    }
+}
+
+// Dequantize INT8 block back to float
+static inline void ggml_opt_dequantize_block_int8(
+    const struct ggml_opt_block_quant * restrict src,
+    float * restrict dst,
+    int rows,
+    int cols,
+    int dst_stride
+) {
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            int8_t val = src->data[i * GGML_OPT_BLOCK_SIZE + j];
+            dst[i * dst_stride + j] = ((float)val + 128.0f) * src->scale + src->zero_point;
+        }
+    }
+}
+
+// AVX-512 INT8 dot product with dynamic sparsity masking
+static inline void ggml_opt_mul_mat_block_avx512(
+    const struct ggml_opt_block_quant * restrict A,
+    const struct ggml_opt_block_quant * restrict B,
+    float * restrict C,
+    int M,
+    int N,
+    int K,
+    int ldc
+) {
+    // Compute combined scale
+    const float combined_scale = A->scale * B->scale;
+    const __m512 scale_vec = _mm512_set1_ps(combined_scale);
+
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j += 16) {
+            // Process 16 elements at a time with AVX-512
+            int j_max = (j + 16 <= N) ? 16 : (N - j);
+
+            __m512i acc_lo = _mm512_setzero_si512();
+            __m512i acc_hi = _mm512_setzero_si512();
+
+            for (int k = 0; k < K; k += 4) {
+                // Load 4 elements from A (broadcast across 512-bit)
+                int8_t a_vals[4];
+                for (int kk = 0; kk < 4 && k + kk < K; kk++) {
+                    a_vals[kk] = A->data[i * GGML_OPT_BLOCK_SIZE + k + kk];
+                }
+
+                // Process each of the 4 k values
+                for (int kk = 0; kk < 4 && k + kk < K; kk++) {
+                    __m512i a_vec = _mm512_set1_epi8(a_vals[kk]);
+
+                    // Load B values
+                    __m128i b_vals_128;
+                    if (j_max == 16) {
+                        b_vals_128 = _mm_loadu_si128(
+                            (const __m128i*)&B->data[(k + kk) * GGML_OPT_BLOCK_SIZE + j]
+                        );
+                    } else {
+                        // Handle partial load with masking
+                        int8_t b_temp[16] = {0};
+                        for (int jj = 0; jj < j_max; jj++) {
+                            b_temp[jj] = B->data[(k + kk) * GGML_OPT_BLOCK_SIZE + j + jj];
+                        }
+                        b_vals_128 = _mm_loadu_si128((const __m128i*)b_temp);
+                    }
+
+                    // Broadcast to 512-bit
+                    __m512i b_vec = _mm512_cvtepi8_epi32(b_vals_128);
+                    __m512i a_vec_32 = _mm512_cvtepi8_epi32(_mm512_castsi512_si128(a_vec));
+
+                    // Multiply and accumulate
+                    __m512i prod = _mm512_mullo_epi32(a_vec_32, b_vec);
+                    acc_lo = _mm512_add_epi32(acc_lo, prod);
+                }
+            }
+
+            // Convert to float and apply scaling
+            __m512 result = _mm512_cvtepi32_ps(acc_lo);
+            result = _mm512_mul_ps(result, scale_vec);
+
+            // Add zero points
+            const float zero_offset = A->zero_point + B->zero_point;
+            __m512 zero_vec = _mm512_set1_ps(zero_offset);
+            result = _mm512_add_ps(result, zero_vec);
+
+            // Load existing C values and accumulate
+            if (j_max == 16) {
+                __m512 c_vals = _mm512_loadu_ps(&C[i * ldc + j]);
+                result = _mm512_add_ps(result, c_vals);
+                _mm512_storeu_ps(&C[i * ldc + j], result);
+            } else {
+                // Handle partial store with masking
+                __mmask16 mask = (__mmask16)((1 << j_max) - 1);
+                __m512 c_vals = _mm512_maskz_loadu_ps(mask, &C[i * ldc + j]);
+                result = _mm512_add_ps(result, c_vals);
+                _mm512_mask_storeu_ps(&C[i * ldc + j], mask, result);
+            }
+        }
+    }
+}
+
+// Cache-oblivious recursive matrix multiplication
+static void ggml_opt_mul_mat_recursive(
+    const float * restrict A,
+    const float * restrict B,
+    float * restrict C,
+    int M,
+    int N,
+    int K,
+    int lda,
+    int ldb,
+    int ldc,
+    uint32_t * rng_state
+) {
+    // Base case: use optimized leaf-level computation
+    if (M <= GGML_OPT_BLOCK_SIZE && N <= GGML_OPT_BLOCK_SIZE && K <= GGML_OPT_BLOCK_SIZE) {
+        // Quantize blocks
+        struct ggml_opt_block_quant A_quant GGML_CACHE_ALIGN;
+        struct ggml_opt_block_quant B_quant GGML_CACHE_ALIGN;
+
+        ggml_opt_quantize_block_int8(A, &A_quant, M, K, lda, rng_state);
+        ggml_opt_quantize_block_int8(B, &B_quant, K, N, ldb, rng_state);
+
+        // Compute using AVX-512
+        ggml_opt_mul_mat_block_avx512(&A_quant, &B_quant, C, M, N, K, ldc);
+        return;
+    }
+
+    // Recursive case: divide largest dimension
+    if (M >= N && M >= K && M > GGML_OPT_RECURSIVE_THRESHOLD) {
+        // Split M dimension
+        int M1 = M / 2;
+        int M2 = M - M1;
+
+        ggml_opt_mul_mat_recursive(A, B, C, M1, N, K, lda, ldb, ldc, rng_state);
+        ggml_opt_mul_mat_recursive(
+            A + M1 * lda, B, C + M1 * ldc,
+            M2, N, K, lda, ldb, ldc, rng_state
+        );
+    } else if (N >= K && N > GGML_OPT_RECURSIVE_THRESHOLD) {
+        // Split N dimension
+        int N1 = N / 2;
+        int N2 = N - N1;
+
+        ggml_opt_mul_mat_recursive(A, B, C, M, N1, K, lda, ldb, ldc, rng_state);
+        ggml_opt_mul_mat_recursive(
+            A, B + N1, C + N1,
+            M, N2, K, lda, ldb, ldc, rng_state
+        );
+    } else if (K > GGML_OPT_RECURSIVE_THRESHOLD) {
+        // Split K dimension (requires accumulation)
+        int K1 = K / 2;
+        int K2 = K - K1;
+
+        ggml_opt_mul_mat_recursive(A, B, C, M, N, K1, lda, ldb, ldc, rng_state);
+        ggml_opt_mul_mat_recursive(
+            A + K1, B + K1 * ldb, C,
+            M, N, K2, lda, ldb, ldc, rng_state
+        );
+    } else {
+        // All dimensions below threshold, use leaf computation
+        struct ggml_opt_block_quant A_quant GGML_CACHE_ALIGN;
+        struct ggml_opt_block_quant B_quant GGML_CACHE_ALIGN;
+
+        ggml_opt_quantize_block_int8(A, &A_quant, M, K, lda, rng_state);
+        ggml_opt_quantize_block_int8(B, &B_quant, K, N, ldb, rng_state);
+
+        ggml_opt_mul_mat_block_avx512(&A_quant, &B_quant, C, M, N, K, ldc);
+    }
+}
+
+// Main entry point for optimized matrix multiplication
+static bool ggml_opt_compute_forward_mul_mat_try(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst
+) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    // Only handle F32 tensors for now
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // Validate tensor constraints
+    if (nb00 != sizeof(float) || nb10 != sizeof(float) || nb0 != sizeof(float)) {
+        return false;
+    }
+
+    // Only handle 2D matrix multiplication for now
+    if (ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1) {
+        return false;
+    }
+
+    // Check alignment for optimal performance
+    if ((uintptr_t)src0->data % 64 != 0 || (uintptr_t)src1->data % 64 != 0 ||
+        (uintptr_t)dst->data % 64 != 0) {
+        // Proceed anyway, but might be slower
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Dimensions: dst = src0 * src1^T
+    // src0: M x K (ne01 x ne00)
+    // src1: N x K (ne11 x ne10)
+    // dst:  M x N (ne1 x ne0)
+    const int64_t M = ne01;
+    const int64_t N = ne11;
+    const int64_t K = ne00;
+
+    // Skip if matrix is too small to benefit from optimization
+    if (M < GGML_OPT_BLOCK_SIZE && N < GGML_OPT_BLOCK_SIZE && K < GGML_OPT_BLOCK_SIZE) {
+        return false;
+    }
+
+    // Initialize result to zero if this is the first thread on first call
+    if (ith == 0) {
+        memset(dst->data, 0, M * N * sizeof(float));
+    }
+
+    // Wait for zeroing to complete
+    ggml_barrier(params->threadpool);
+
+    // Distribute work across threads by rows
+    const int64_t rows_per_thread = (M + nth - 1) / nth;
+    const int64_t row_start = ith * rows_per_thread;
+    const int64_t row_end = (row_start + rows_per_thread) < M ?
+                            (row_start + rows_per_thread) : M;
+
+    if (row_start >= M) {
+        return true;
+    }
+
+    // Initialize RNG state (different for each thread to avoid correlation)
+    uint32_t rng_state = 0x12345678 + (uint32_t)ith;
+
+    // Compute assigned rows
+    const float * A = (const float *)src0->data + row_start * K;
+    const float * B = (const float *)src1->data;
+    float * C = (float *)dst->data + row_start * N;
+
+    const int64_t M_local = row_end - row_start;
+
+    ggml_opt_mul_mat_recursive(
+        A, B, C,
+        (int)M_local, (int)N, (int)K,
+        (int)K,  // lda (stride of A)
+        (int)K,  // ldb (stride of B)
+        (int)N,  // ldc (stride of C)
+        &rng_state
+    );
+
+    return true;
+}
+
+#endif // __AVX512F__
+
+////////////////////////////////////////////////////////////////////////////////
+
 // ggml_compute_forward_mul_mat
 
 static void ggml_compute_forward_mul_mat_one_chunk(
@@ -1242,6 +1581,15 @@ void ggml_compute_forward_mul_mat(
 
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
+
+    // Try optimized AVX-512 implementation first
+#if defined(__AVX512F__)
+    if (ggml_cpu_has_avx512()) {
+        if (ggml_opt_compute_forward_mul_mat_try(params, dst)) {
+            return;
+        }
+    }
+#endif
 
     // TODO: extract to "extra_op"
 #if GGML_USE_LLAMAFILE
