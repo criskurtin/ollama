@@ -286,7 +286,7 @@ func BenchmarkAVX512MatmulSmall(b *testing.B) {
 			B := ctx.Arange(0, float32(size*size), 1, ml.DTypeF32).Reshape(ctx, size, size)
 
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				C := A.Mulmat(ctx, B)
 				ctx.Forward(C).Compute(C)
 			}
@@ -309,7 +309,7 @@ func BenchmarkAVX512MatmulLarge(b *testing.B) {
 			B := ctx.Arange(0, float32(size*size), 1, ml.DTypeF32).Reshape(ctx, size, size)
 
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				C := A.Mulmat(ctx, B)
 				ctx.Forward(C).Compute(C)
 			}
