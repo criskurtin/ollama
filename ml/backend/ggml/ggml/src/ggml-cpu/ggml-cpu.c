@@ -1120,7 +1120,14 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 // Optimized matrix multiplication for AVX-512 CPUs
 // Uses cache-oblivious recursive blocking, INT8 quantization, and fused pipeline
 
-#if defined(__AVX512F__)
+// Enable AVX-512 for this section using function attributes
+// This allows runtime detection without requiring the whole binary to be AVX-512
+#if defined(__GNUC__) || defined(__clang__)
+#define AVX512_ATTR __attribute__((target("avx512f,avx512dq,avx512bw,avx512vl")))
+#else
+#define AVX512_ATTR
+#endif
+
 #include <immintrin.h>
 
 // Block size for leaf-level computation (fits in L1 cache)
@@ -1213,6 +1220,7 @@ static inline void ggml_opt_dequantize_block_int8(
 }
 
 // AVX-512 INT8 dot product with dynamic sparsity masking
+AVX512_ATTR
 static inline void ggml_opt_mul_mat_block_avx512(
     const struct ggml_opt_block_quant * restrict A,
     const struct ggml_opt_block_quant * restrict B,
@@ -1296,6 +1304,7 @@ static inline void ggml_opt_mul_mat_block_avx512(
 }
 
 // Cache-oblivious recursive matrix multiplication
+AVX512_ATTR
 static void ggml_opt_mul_mat_recursive(
     const float * restrict A,
     const float * restrict B,
@@ -1353,8 +1362,38 @@ static void ggml_opt_mul_mat_recursive(
             A + K1, B + K1 * ldb, C,
             M, N, K2, lda, ldb, ldc, rng_state
         );
+    } else if (M > GGML_OPT_BLOCK_SIZE) {
+        // Still need to split M dimension even though below recursive threshold
+        int M1 = M / 2;
+        int M2 = M - M1;
+
+        ggml_opt_mul_mat_recursive(A, B, C, M1, N, K, lda, ldb, ldc, rng_state);
+        ggml_opt_mul_mat_recursive(
+            A + M1 * lda, B, C + M1 * ldc,
+            M2, N, K, lda, ldb, ldc, rng_state
+        );
+    } else if (N > GGML_OPT_BLOCK_SIZE) {
+        // Still need to split N dimension even though below recursive threshold
+        int N1 = N / 2;
+        int N2 = N - N1;
+
+        ggml_opt_mul_mat_recursive(A, B, C, M, N1, K, lda, ldb, ldc, rng_state);
+        ggml_opt_mul_mat_recursive(
+            A, B + N1, C + N1,
+            M, N2, K, lda, ldb, ldc, rng_state
+        );
+    } else if (K > GGML_OPT_BLOCK_SIZE) {
+        // Still need to split K dimension even though below recursive threshold
+        int K1 = K / 2;
+        int K2 = K - K1;
+
+        ggml_opt_mul_mat_recursive(A, B, C, M, N, K1, lda, ldb, ldc, rng_state);
+        ggml_opt_mul_mat_recursive(
+            A + K1, B + K1 * ldb, C,
+            M, N, K2, lda, ldb, ldc, rng_state
+        );
     } else {
-        // All dimensions below threshold, use leaf computation
+        // All dimensions <= BLOCK_SIZE, safe to use leaf computation
         struct ggml_opt_block_quant A_quant GGML_CACHE_ALIGN;
         struct ggml_opt_block_quant B_quant GGML_CACHE_ALIGN;
 
@@ -1366,6 +1405,7 @@ static void ggml_opt_mul_mat_recursive(
 }
 
 // Main entry point for optimized matrix multiplication
+AVX512_ATTR
 static bool ggml_opt_compute_forward_mul_mat_try(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst
@@ -1451,8 +1491,6 @@ static bool ggml_opt_compute_forward_mul_mat_try(
 
     return true;
 }
-
-#endif // __AVX512F__
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -1582,14 +1620,12 @@ void ggml_compute_forward_mul_mat(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
-    // Try optimized AVX-512 implementation first
-#if defined(__AVX512F__)
-    if (ggml_cpu_has_avx512()) {
+    // Try optimized AVX-512 implementation first (runtime detection)
+    if (__builtin_cpu_supports("avx512f")) {
         if (ggml_opt_compute_forward_mul_mat_try(params, dst)) {
             return;
         }
     }
-#endif
 
     // TODO: extract to "extra_op"
 #if GGML_USE_LLAMAFILE
