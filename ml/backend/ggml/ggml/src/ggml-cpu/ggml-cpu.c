@@ -1448,7 +1448,14 @@ static bool ggml_opt_compute_forward_mul_mat_try(
     const int64_t K = ne00;
 
     // Skip if matrix is too small to benefit from optimization
+    // All dimensions must be >= 32, OR at least one dimension >= 256 with M >= 8
     if (M < GGML_OPT_BLOCK_SIZE && N < GGML_OPT_BLOCK_SIZE && K < GGML_OPT_BLOCK_SIZE) {
+        return false;
+    }
+ 
+    // Skip extremely thin matrices (M < 8) as quantization overhead isn't worth it
+    // These occur during single-token generation and benefit from different optimizations
+    if (M < 8) {
         return false;
     }
 
